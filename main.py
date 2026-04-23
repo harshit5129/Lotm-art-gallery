@@ -122,7 +122,15 @@ def get_env_var(var_name: str, default: Optional[str] = None) -> str:
     return value
 
 
-def get_headers(auth_token: str) -> Dict[str, str]:
+def get_headers(auth_token: str, auth_method: str = "user") -> Dict[str, str]:
+    """Get headers for Discord API requests.
+    
+    Args:
+        auth_token: The authentication token
+        auth_method: Either "user" for user auth token or "bot" for bot token
+    """
+    if auth_method == "bot":
+        return {"authorization": f"Bot {auth_token}"}
     return {"authorization": auth_token}
 
 
@@ -1964,9 +1972,44 @@ def telegram_transfer_cli(
     _cleanup_temp_dir(temp_dir)
 
 
+def select_auth_method() -> tuple[str, str]:
+    """Ask user to select authentication method and return token with method."""
+    console.print(Panel.fit("[bold green]Discord Art Gallery Manager[/bold green]", padding=1))
+    console.print("\n[cyan]Select Discord Authentication Method:[/cyan]")
+    console.print(" [1] User Token (Authorization header)")
+    console.print(" [2] Bot Token (Bot prefix)")
+    console.print(" [0] Exit\n")
+
+    while True:
+        choice = input("Select option: ").strip()
+
+        if choice == "0":
+            sys.exit(0)
+        elif choice == "1":
+            auth_method = "user"
+            env_var = "DISCORD_AUTH_TOKEN"
+            break
+        elif choice == "2":
+            auth_method = "bot"
+            env_var = "DISCORD_BOT_TOKEN"
+            break
+        else:
+            console.print("[red]Invalid option[/red]")
+
+    try:
+        token = get_env_var(env_var)
+        console.print(f"[green]Using {'User' if auth_method == 'user' else 'Bot'} authentication[/green]")
+        return token, auth_method
+    except ValueError as e:
+        console.print(f"[red]Configuration error: {e}[/red]")
+        console.print(f"[yellow]Please set {env_var} in your .env file[/yellow]")
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Discord Art Gallery Manager")
     parser.add_argument("--interactive", action="store_true", help="Run in interactive mode")
+    parser.add_argument("--auth-method", choices=["user", "bot"], help="Authentication method (user/bot)")
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -1997,8 +2040,8 @@ def main() -> None:
     # telegram transfer
     telegram_transfer_parser = telegram_subparsers.add_parser("transfer", help="Transfer Discord channel to Telegram")
     telegram_transfer_parser.add_argument("--channel-id", required=True, help="Discord channel ID")
-    telegram_transfer_parser.add_argument("--auth-token", help="Discord Auth Token (or set DISCORD_AUTH_TOKEN env)")
-    telegram_transfer_parser.add_argument("--bot-token", help="Telegram Bot Token (or set TELEGRAM_BOT_TOKEN env)")
+    telegram_transfer_parser.add_argument("--discord-token", help="Discord Auth/Bot Token (or set env)")
+    telegram_transfer_parser.add_argument("--telegram-bot-token", help="Telegram Bot Token (or set TELEGRAM_BOT_TOKEN env)")
     telegram_transfer_parser.add_argument("--chat-id", help="Telegram Chat ID (or set TELEGRAM_CHAT_ID env)")
     telegram_transfer_parser.add_argument("--include-text", action="store_true", help="Include text content as captions")
     telegram_transfer_parser.add_argument("--albums", action="store_true", help="Send as albums")
@@ -2007,12 +2050,50 @@ def main() -> None:
 
     load_dotenv()
 
+    # Load auth method from env or CLI
+    if args.auth_method:
+        auth_method = args.auth_method
+        if auth_method == "user":
+            env_var = "DISCORD_AUTH_TOKEN"
+        else:
+            env_var = "DISCORD_BOT_TOKEN"
+        try:
+            AUTH_TOKEN = get_env_var(env_var)
+        except ValueError as e:
+            console.print(f"[red]Configuration error: {e}[/red]")
+            return
+    else:
+        # Interactive mode - ask user
+        if args.interactive or len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] == "--interactive"):
+            AUTH_TOKEN, auth_method = select_auth_method()
+        else:
+            # CLI mode - try user token first, then bot
+            try:
+                AUTH_TOKEN = get_env_var("DISCORD_AUTH_TOKEN")
+                auth_method = "user"
+            except ValueError:
+                try:
+                    AUTH_TOKEN = get_env_var("DISCORD_BOT_TOKEN")
+                    auth_method = "bot"
+                except ValueError:
+                    console.print("[red]Error: No Discord token found[/red]")
+                    console.print("[yellow]Set DISCORD_AUTH_TOKEN or DISCORD_BOT_TOKEN in .env[/yellow]")
+                    return
+
+    # Store auth method globally for get_headers
+    config.AUTH_METHOD = auth_method
+
     try:
-        AUTH_TOKEN = get_env_var("DISCORD_AUTH_TOKEN")
         MEDIA_BASE_DIR = get_env_var("MEDIA_DIRECTORY", "extracted_media")
-    except ValueError as e:
-        console.print(f"[red]Configuration error: {e}[/red]")
-        return
+    except ValueError:
+        MEDIA_BASE_DIR = "extracted_media"
+
+    # Rebind functions with auth method
+    global get_headers
+    original_get_headers = get_headers
+    def get_headers_with_method(token: str) -> Dict[str, str]:
+        return original_get_headers(token, getattr(config, 'AUTH_METHOD', 'user'))
+    get_headers = get_headers_with_method
 
     if args.interactive or (len(sys.argv) == 1 and sys.stdin.isatty()):
         interactive_menu(AUTH_TOKEN, MEDIA_BASE_DIR)
@@ -2026,30 +2107,30 @@ def main() -> None:
         transfer_images(args.source_dir, args.target_channel_id, AUTH_TOKEN)
     elif args.command == "telegram":
         if args.telegram_command == "upload":
-            bot_token = args.bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
+            telegram_bot_token = args.telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
             chat_id = args.chat_id or os.getenv("TELEGRAM_CHAT_ID")
 
-            if not bot_token or not chat_id:
+            if not telegram_bot_token or not chat_id:
                 console.print("[red]Error: Telegram bot token and chat ID required[/red]")
-                console.print("[yellow]Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env or use --bot-token and --chat-id[/yellow]")
+                console.print("[yellow]Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env[/yellow]")
                 return
 
-            telegram_upload_cli(args.source_dir, bot_token, chat_id, args.albums)
+            telegram_upload_cli(args.source_dir, telegram_bot_token, chat_id, args.albums)
 
         elif args.telegram_command == "transfer":
-            auth_token = args.auth_token or AUTH_TOKEN
-            bot_token = args.bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
+            discord_token = args.discord_token or AUTH_TOKEN
+            telegram_bot_token = args.telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
             chat_id = args.chat_id or os.getenv("TELEGRAM_CHAT_ID")
 
-            if not bot_token or not chat_id:
+            if not telegram_bot_token or not chat_id:
                 console.print("[red]Error: Telegram bot token and chat ID required[/red]")
-                console.print("[yellow]Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env or use --bot-token and --chat-id[/yellow]")
+                console.print("[yellow]Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env[/yellow]")
                 return
 
             telegram_transfer_cli(
                 args.channel_id,
-                auth_token,
-                bot_token,
+                discord_token,
+                telegram_bot_token,
                 chat_id,
                 MEDIA_BASE_DIR,
                 args.include_text,
