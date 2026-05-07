@@ -5,6 +5,8 @@ import argparse
 import sys
 import time
 import random
+import sqlite3
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any, TypedDict, Callable
@@ -89,6 +91,72 @@ class Config:
 
 
 config = Config()
+
+DB_PATH = Path("extracted_media/images.db")
+
+
+def get_db_connection() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_image_db() -> None:
+    conn = get_db_connection()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS extracted_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            url TEXT UNIQUE NOT NULL,
+            file_path TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            filename TEXT,
+            download_timestamp TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_url ON extracted_images(url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_hash ON extracted_images(file_hash)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_channel ON extracted_images(channel_id)")
+    conn.commit()
+    conn.close()
+
+
+def image_exists_by_url(url: str) -> bool:
+    conn = get_db_connection()
+    result = conn.execute("SELECT 1 FROM extracted_images WHERE url = ?", (url,)).fetchone()
+    conn.close()
+    return result is not None
+
+
+def image_exists_by_hash(file_hash: str) -> bool:
+    conn = get_db_connection()
+    result = conn.execute("SELECT 1 FROM extracted_images WHERE file_hash = ?", (file_hash,)).fetchone()
+    conn.close()
+    return result is not None
+
+
+def record_image(
+    message_id: str, channel_id: str, url: str, file_path: str, file_hash: str, filename: str
+) -> None:
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO extracted_images
+            (message_id, channel_id, url, file_path, file_hash, filename, download_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (message_id, channel_id, url, file_path, file_hash, filename, datetime.now().isoformat()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    finally:
+        conn.close()
 
 
 class AsyncHTTPClient:
@@ -271,18 +339,35 @@ def count_images_in_channel(channel_id: str, auth_token: str) -> int:
     return image_count
 
 
-def download_media(url: str, folder_path: Path, filename: str, message_id: str) -> bool:
+def download_media(url: str, folder_path: Path, filename: str, message_id: str, channel_id: str) -> bool:
+    if image_exists_by_url(url):
+        return False
+
     try:
         response = requests.get(url, timeout=config.REQUEST_TIMEOUT)
         response.raise_for_status()
+
+        content = response.content
+        file_hash = hashlib.sha256(content).hexdigest()
+
+        if image_exists_by_hash(file_hash):
+            return False
 
         file_extension = Path(filename).suffix
         safe_filename = f"{message_id}{file_extension}"
         file_path = folder_path / safe_filename
 
         with open(file_path, "wb") as file:
-            file.write(response.content)
+            file.write(content)
 
+        record_image(
+            message_id=message_id,
+            channel_id=channel_id,
+            url=url,
+            file_path=str(file_path),
+            file_hash=file_hash,
+            filename=filename,
+        )
         return True
     except requests.RequestException:
         return False
@@ -585,7 +670,7 @@ def retrieve_messages(
                     }
 
                     if url and filename and message_id and content_type.startswith("image/"):
-                        if download_media(url, media_folder, filename, message_id):
+                        if download_media(url, media_folder, filename, message_id, channel_id):
                             stats["media_downloaded"] += 1
                             attachment_data["downloaded"] = True
                         else:
@@ -826,7 +911,7 @@ def transfer_images_batch(
                         safe_filename = f"{item['message_id']}{file_extension}"
                         file_path = temp_dir / safe_filename
 
-                        if download_media(item["url"], temp_dir, item["filename"], item["message_id"]):
+                        if download_media(item["url"], temp_dir, item["filename"], item["message_id"], source_channel_id):
                             message_content = item["content"] if item["content"] else ""
                             if upload_image_with_text(file_path, target_channel_id, auth_token, message_content):
                                 stats["images_transferred"] += 1
@@ -850,7 +935,7 @@ def transfer_images_batch(
                 safe_filename = f"{item['message_id']}{file_extension}"
                 file_path = temp_dir / safe_filename
 
-                if download_media(item["url"], temp_dir, item["filename"], item["message_id"]):
+                if download_media(item["url"], temp_dir, item["filename"], item["message_id"], source_channel_id):
                     message_content = item["content"] if item["content"] else ""
                     if upload_image_with_text(file_path, target_channel_id, auth_token, message_content):
                         stats["images_transferred"] += 1
@@ -890,7 +975,6 @@ def transfer_discord_to_telegram_batch(
     }
 
     last_message_id = None
-    image_batch = []  # For Telegram upload
     messages_with_text_sent = set()
 
     with Progress(
@@ -937,41 +1021,33 @@ def transfer_discord_to_telegram_batch(
                         safe_filename = f"{message_id}{file_extension}"
                         file_path = temp_dir / safe_filename
 
-                        if download_media(url, temp_dir, filename, message_id):
-                            image_batch.append({
+                        if download_media(url, temp_dir, filename, message_id, source_channel_id):
+                            # Send immediately after download
+                            item = {
                                 "file_path": file_path,
                                 "caption": caption,
-                            })
+                            }
 
-                            # Process batch when full
-                            if use_albums and len(image_batch) >= config.TELEGRAM_MAX_ALBUM_SIZE:
-                                tg_stats = upload_to_telegram_batch(image_batch, bot_token, chat_id, use_albums=True)
-                                stats["images_transferred"] += tg_stats["images_uploaded"]
-                                stats["failed_transfers"] += tg_stats["failed_uploads"]
-                                stats["text_transferred"] += tg_stats["text_captions"]
+                            if use_albums:
+                                tg_stats = upload_to_telegram_batch([item], bot_token, chat_id, use_albums=False)
+                            else:
+                                tg_stats = upload_to_telegram_batch([item], bot_token, chat_id, use_albums=False)
 
-                                # Cleanup
-                                for item in image_batch:
-                                    if item["file_path"].exists():
-                                        item["file_path"].unlink()
+                            if tg_stats["images_uploaded"] > 0:
+                                stats["images_transferred"] += 1
+                                if caption:
+                                    stats["text_transferred"] += 1
+                            else:
+                                stats["failed_transfers"] += 1
 
-                                image_batch = []
-                                progress.update(task, description=f"Transferred {stats['images_transferred']} images to Telegram")
+                            # Delete file after sending
+                            if file_path.exists():
+                                file_path.unlink()
+
+                            progress.update(task, description=f"Transferred {stats['images_transferred']} images to Telegram")
 
                         else:
                             stats["failed_transfers"] += 1
-
-        # Process remaining images
-        if image_batch:
-            tg_stats = upload_to_telegram_batch(image_batch, bot_token, chat_id, use_albums=use_albums)
-            stats["images_transferred"] += tg_stats["images_uploaded"]
-            stats["failed_transfers"] += tg_stats["failed_uploads"]
-            stats["text_transferred"] += tg_stats["text_captions"]
-
-            # Cleanup
-            for item in image_batch:
-                if item["file_path"].exists():
-                    item["file_path"].unlink()
 
         progress.update(task, description=f"Transfer complete! ({stats['images_transferred']} images)")
 
@@ -2007,6 +2083,8 @@ def select_auth_method() -> tuple[str, str]:
 
 
 def main() -> None:
+    init_image_db()
+
     parser = argparse.ArgumentParser(description="Discord Art Gallery Manager")
     parser.add_argument("--interactive", action="store_true", help="Run in interactive mode")
     parser.add_argument("--auth-method", choices=["user", "bot"], help="Authentication method (user/bot)")
